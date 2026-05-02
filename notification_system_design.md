@@ -124,4 +124,4 @@ Three options were considered. **WebSocket** is the chosen primary, with **SSE**
 The server publishes new notifications onto a Redis Pub/Sub channel keyed per student; each WebSocket worker subscribes only to channels for the students currently connected to it. This keeps the design horizontally scalable.
 
 ---
-
+Stage 1 end
