@@ -216,3 +216,87 @@ SELECT id, $1, $2, $3 FROM students WHERE cohort_id = $4;
 
 ---
 
+## Stage 3
+
+### Reviewing the existing query
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC;
+```
+
+**Is it accurate?** Functionally yes — it returns the rows the user expects.
+
+**Why is it slow?**
+
+1. **`SELECT *`** drags every column, including big `payload`/`message` blobs the inbox listing doesn't need.
+2. **No `LIMIT`** — for a heavy user with thousands of unreads the DB has to materialise and sort the whole set every time.
+3. **Likely no usable index** — without `(studentID, isRead, createdAt DESC)` the planner runs a sequential scan or an index scan that still has to filter and re-sort. With 5M rows this is many seconds.
+4. **Sort cost** — `ORDER BY createdAt DESC` on millions of rows blows out work_mem and spills to disk.
+5. **Live-data hotspot** — every page load runs this; cumulative cost dominates DB CPU.
+
+**Computational cost (roughly):**
+- Without index: O(N) scan + O(K log K) sort, where N = total rows in the table (5M), K = matching rows.
+- With the right composite index: O(log N + K) — basically instant.
+
+### "Add an index on every column" — is that safe?
+
+**No.** Indexes are not free:
+
+- Each index adds write amplification — every `INSERT`/`UPDATE` rewrites every relevant index.
+- Indexes consume storage and buffer cache, evicting useful pages.
+- The planner gets confused with too many overlapping indexes and may pick a worse plan.
+- Single-column indexes don't help compound predicates the way composite indexes do.
+
+The right answer is a **small number of carefully chosen composite indexes** that match the actual query patterns — for the inbox, a partial composite is ideal:
+
+```sql
+CREATE INDEX idx_notif_student_unread_recent
+  ON notifications (student_id, created_at DESC)
+  WHERE is_read = FALSE;
+```
+
+This index is *small* (only unread rows), *aligned with the predicate*, and serves the query without an extra sort. Combined with a `LIMIT` and column projection:
+
+```sql
+SELECT id, notification_type, message, created_at
+FROM notifications
+WHERE student_id = 1042 AND is_read = FALSE
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+…the query runs in single-digit milliseconds even on the 5M-row table.
+
+### Find all students who got a placement notification in the last 7 days
+
+```sql
+SELECT DISTINCT student_id
+FROM notifications
+WHERE notification_type = 'Placement'
+  AND created_at >= NOW() - INTERVAL '7 days';
+```
+
+Index supporting this:
+
+```sql
+CREATE INDEX idx_notif_type_recent
+  ON notifications (notification_type, created_at DESC);
+```
+
+If we need student details too, join after the filter:
+
+```sql
+SELECT s.id, s.name, s.email
+FROM students s
+JOIN (
+  SELECT DISTINCT student_id
+  FROM notifications
+  WHERE notification_type = 'Placement'
+    AND created_at >= NOW() - INTERVAL '7 days'
+) n ON n.student_id = s.id;
+```
+
+---
+
