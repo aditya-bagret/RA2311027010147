@@ -1,0 +1,16 @@
+{
+  "name": "notification-app-be",
+  "version": "1.0.0",
+  "description": "Backend service exposing notification APIs for the campus notification platform.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "topten": "node priorityInbox.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "logging-middleware": "file:../logging-middleware"
+  }
+}
