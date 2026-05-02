@@ -338,3 +338,80 @@ The DB gets hammered because **every page load** re-runs an inbox query that alm
 **Recommended layered solution:** WebSocket push + Redis page cache + Redis unread counter + read replica. This handles the 80/20 case and keeps the architecture simple.
 
 ---
+
+## Stage 5
+
+### Shortcomings of the proposed `notify_all`
+
+```python
+function notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+1. **Synchronous & sequential** — 50 000 students × ~300ms per loop = ~4 hours. The HR's request times out.
+2. **No retries** — when `send_email` fails for 200 students mid-way, those students never get the email. There is no record of which ones failed and no way to resume.
+3. **Coupled side effects** — if `save_to_db` fails for a student the email may already be out the door (or vice-versa); the system ends up in an inconsistent state.
+4. **No idempotency** — re-running spams everyone who already received the email.
+5. **No backpressure or rate-limiting** — one giant burst can blow your SMTP quota or push provider's limits.
+6. **No observability** — no per-student status to debug "did Alice get her notification?".
+
+### Should DB save and email send happen together?
+
+**No.** They are *independent* side effects with different failure modes, latency profiles, and providers. You want:
+
+1. Atomically persist the notification to the DB and enqueue a delivery job. (DB write is the source of truth.)
+2. Workers asynchronously pick up jobs and deliver via email / push.
+3. Each delivery is tracked separately with its own state machine: `PENDING → SENT | FAILED`.
+
+This way a failed email retries without touching the DB; a successful email updates only the `email_status` column.
+
+### Redesigned approach
+
+```
+function notify_all(student_ids, message):
+  notification_id = persist_template(message)              # 1 DB row, the canonical record
+  for batch in chunks(student_ids, 1000):                   # batch to avoid huge transactions
+    transaction:
+      bulk_insert_notifications(notification_id, batch)     # one row per (student, channel)
+      enqueue_delivery_jobs(notification_id, batch)         # outbox row
+    end transaction
+
+# Delivery worker
+function deliver_job(job):
+  try:
+    if job.channel == "email":
+      send_email_with_idempotency_key(job.id, ...)
+    else:
+      push_to_app(job.student_id, job.message)
+    mark_job(job.id, "SENT")
+  except RetryableError:
+    schedule_retry_with_backoff(job, attempts < 5)
+  except FatalError as e:
+    mark_job(job.id, "FAILED", reason=str(e))
+    emit_metric("notify.delivery.failed", channel=job.channel)
+```
+
+**Key elements:**
+- **Transactional outbox pattern** — DB write and job enqueue happen in the same transaction, then a relay process publishes to the queue. Guarantees at-least-once without distributed transactions.
+- **Idempotency key per job** — the email provider dedupes if the worker retries.
+- **Exponential backoff with jitter** for transient failures.
+- **Dead-letter queue** for jobs that exhaust retries — surfaced on an admin "delivery health" dashboard.
+- **Separate channels** — email and in-app push are independent jobs so a stuck SMTP doesn't block in-app notifications.
+- **Rate-limited workers** to respect provider quotas.
+
+### What about the 200 mid-way email failures?
+
+With the redesign each of those 200 jobs is just sitting at `PENDING` (or `FAILED` after retries). We do **not** re-run the whole `notify_all`. Instead the operator runs:
+
+```sql
+UPDATE delivery_jobs
+SET status = 'PENDING', next_attempt_at = NOW()
+WHERE notification_id = :id AND status = 'FAILED' AND channel = 'email';
+```
+
+…or simply lets the auto-retry worker drain them. No duplicate emails to the 49 800 who already got it.
+
+---
