@@ -415,3 +415,47 @@ WHERE notification_id = :id AND status = 'FAILED' AND channel = 'email';
 …or simply lets the auto-retry worker drain them. No duplicate emails to the 49 800 who already got it.
 
 ---
+
+## Stage 6
+
+### Approach
+
+Implemented as runnable code in [`notification_app_be/priorityInbox.js`](notification_app_be/priorityInbox.js) and exposed as `GET /notifications/priority?limit=10` from `notification_app_be/server.js`.
+
+### Scoring formula
+
+```
+score = typeWeight × 100 + recencyBonus
+typeWeight: Placement = 3, Result = 2, Event = 1
+recencyBonus = max(0, 100 − hoursOld × (100 / (7 × 24)))
+```
+
+The `× 100` keeps weight categories cleanly separated (Placement starts at 300, Result at 200, Event at 100) while letting recency act as a tiebreaker within a category. Any unread Placement always outranks any Result; recency only matters when types match.
+
+### Data structure — bounded min-heap
+
+Because new notifications are arriving constantly we must **not** re-sort the whole list on every insert. A min-heap of fixed size N gives us:
+
+- Peek-the-weakest in `O(1)` (the heap root).
+- Decide-or-discard a new candidate in `O(log N)`.
+- For top-10 that's ~3-4 comparisons per incoming notification, regardless of total volume.
+
+In production the same `TopNHeap` would sit behind a stream consumer (Kafka / SQS) and update continuously; for this CLI we simply feed every record from the Notification API into it.
+
+### Maintaining the top-10 efficiently as new notifications arrive
+
+1. Keep one heap **per student** in memory (or in Redis sorted sets if we need cross-instance state).
+2. On every notification create event, compute its score and `offer()` to that student's heap. `O(log 10)` work.
+3. Periodically (every few minutes) re-score the top-N because recency decays — items drift down even when no new notifications arrive. A cheap timer that just rebuilds a single 10-item heap from itself is sufficient.
+4. Persist a snapshot to Redis on change so other instances / a server restart don't lose the priority cache.
+
+### Output
+
+The CLI prints the top-10 to stdout for screenshot capture:
+
+```bash
+cd notification_app_be
+npm run topten
+```
+
+The HTTP endpoint returns the same data as JSON for Postman screenshots.
