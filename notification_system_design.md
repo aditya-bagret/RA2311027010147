@@ -124,4 +124,95 @@ Three options were considered. **WebSocket** is the chosen primary, with **SSE**
 The server publishes new notifications onto a Redis Pub/Sub channel keyed per student; each WebSocket worker subscribes only to channels for the students currently connected to it. This keeps the design horizontally scalable.
 
 ---
-Stage 1 end
+
+## Stage 2
+
+### DB choice — **PostgreSQL** (relational)
+
+Why:
+
+- **Strong, well-understood query patterns** — every API call is a slice on `(studentId, type, isRead, createdAt)`. SQL with the right composite index makes this trivial.
+- **Strong consistency** matters for "mark read" — students are confused when a notification reappears.
+- **Mature ecosystem**: partitioning, logical replication, extensions like `pg_partman`, JSONB for forward-compatible payloads.
+- **Easy reporting** for admins (campus-wide stats, audit trails) — much harder on a document store.
+
+NoSQL alternatives (MongoDB, DynamoDB) would scale writes more easily but at the cost of rich querying and aggregations the admin dashboards need. We solve write scale with partitioning + read-replicas instead.
+
+### Schema
+
+```sql
+CREATE TYPE notification_type AS ENUM ('Placement', 'Result', 'Event');
+
+CREATE TABLE students (
+  id          BIGSERIAL PRIMARY KEY,
+  email       CITEXT UNIQUE NOT NULL,
+  name        TEXT NOT NULL,
+  cohort_id   BIGINT,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- One row per delivered notification (per student).
+CREATE TABLE notifications (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id         BIGINT NOT NULL REFERENCES students(id),
+  notification_type  notification_type NOT NULL,
+  message            TEXT NOT NULL,
+  payload            JSONB,
+  is_read            BOOLEAN NOT NULL DEFAULT FALSE,
+  read_at            TIMESTAMPTZ,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (created_at);
+
+-- monthly partitions, e.g.
+CREATE TABLE notifications_2026_05
+  PARTITION OF notifications FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+
+-- The single most important index for the inbox query:
+CREATE INDEX idx_notif_student_unread_recent
+  ON notifications (student_id, is_read, created_at DESC)
+  WHERE is_read = FALSE;
+
+CREATE INDEX idx_notif_student_type_recent
+  ON notifications (student_id, notification_type, created_at DESC);
+```
+
+### Sample queries that back the REST API
+
+```sql
+-- GET /notifications  (paginated by createdAt)
+SELECT id, notification_type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1
+  AND ($2::notification_type IS NULL OR notification_type = $2)
+  AND ($3::boolean IS NULL OR is_read = $3)
+  AND created_at < $4
+ORDER BY created_at DESC
+LIMIT $5;
+
+-- GET /notifications/unread-count
+SELECT COUNT(*) FROM notifications
+WHERE student_id = $1 AND is_read = FALSE;
+
+-- PATCH /notifications/:id/read
+UPDATE notifications
+SET is_read = TRUE, read_at = NOW()
+WHERE id = $1 AND student_id = $2 AND is_read = FALSE;
+
+-- POST /admin/notifications  (insert in batch)
+INSERT INTO notifications (student_id, notification_type, message, payload)
+SELECT id, $1, $2, $3 FROM students WHERE cohort_id = $4;
+```
+
+### Problems as data grows, and mitigations
+
+| Problem                                         | Mitigation                                                   |
+|-------------------------------------------------|--------------------------------------------------------------|
+| Table bloat from 5M+ rows hot                   | **Range partition by `created_at`** monthly; old partitions detached / archived to cold storage |
+| Inbox query degrades on cold rows               | **Partial index** on `is_read = FALSE` keeps the working set tiny |
+| Write storm during bulk Notify-All               | Batched inserts via `COPY` + a queue (see Stage 5)           |
+| Read fanout (badges polled every page load)     | Cache (see Stage 4)                                          |
+| `UPDATE` on every read causes index bloat       | `HOT` updates work because `is_read` isn't in most indexes; periodic `REINDEX CONCURRENTLY` |
+| Backups taking too long                         | Per-partition backups; archive cold partitions to S3         |
+
+---
+
