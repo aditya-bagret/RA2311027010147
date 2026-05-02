@@ -1,0 +1,16 @@
+{
+  "name": "vehicle-maintence-scheduler",
+  "version": "1.0.0",
+  "description": "Microservice that picks the best subset of vehicles to service within a depot's mechanic-hour budget.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "logging-middleware": "file:../logging-middleware"
+  }
+}
