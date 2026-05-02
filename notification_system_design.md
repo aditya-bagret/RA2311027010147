@@ -300,3 +300,41 @@ JOIN (
 
 ---
 
+## Stage 4
+
+The DB gets hammered because **every page load** re-runs an inbox query that almost always returns the same data. This is a textbook caching problem. Strategies, ordered by how I'd layer them:
+
+### 1. Read-through cache for the inbox payload (Redis)
+
+- **Key:** `inbox:{studentId}:v{cacheVersion}` → JSON of the first page (20 most recent).
+- **TTL:** 60 seconds (good enough for "near real-time"; the WebSocket push covers true-real-time anyway).
+- **Invalidation:** bump `cacheVersion` for the student whenever a new notification arrives, or when the user marks something as read. Cheaper than deleting the key from N different workers.
+- **Tradeoff:** stale reads up to 60s if the WebSocket push misses; eliminated by also publishing a cache-bust on the same channel.
+
+### 2. Unread-count cache (Redis counter)
+
+- `unread:{studentId}` → integer, INCR on insert, DECR on mark-read.
+- **Tradeoff:** counter drift if a write fails between DB and Redis. Mitigated by a nightly job that recomputes the counter from the DB.
+
+### 3. CDN / browser cache for static parts
+
+- The notification list itself can't be edge-cached, but the metadata (types, icons, copy templates) can. Set `Cache-Control: max-age=300` on those.
+
+### 4. WebSocket push instead of polling
+
+- Once the client opens a socket, it doesn't need to re-fetch on every page load — the server sends deltas. **The single biggest reduction in DB load.**
+- **Tradeoff:** stateful connections are harder to scale; needs sticky LB or a pub/sub fan-out (Redis / NATS).
+
+### 5. Read replicas for inbox queries
+
+- Route all `GET /notifications` traffic to a follower; writes still hit the primary.
+- **Tradeoff:** replication lag (usually <100ms) means a freshly created notification might not be visible on the next read. Acceptable when paired with the WebSocket push.
+
+### 6. Materialised "feed" table per student (last-resort)
+
+- Pre-aggregate the top 20 per student into a denormalised table updated by a worker.
+- **Tradeoff:** great read performance, but writes get more complex and the storage cost roughly doubles.
+
+**Recommended layered solution:** WebSocket push + Redis page cache + Redis unread counter + read replica. This handles the 80/20 case and keeps the architecture simple.
+
+---
